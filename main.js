@@ -1,6 +1,6 @@
 /**
  * ==============================================================================
- * Google Calendar Multi-Sync to Primary (v2.3)
+ * Google Calendar Multi-Sync to Primary (v2.4)
  * ==============================================================================
  *
  * @description This script performs a robust, one-way synchronization from
@@ -15,11 +15,12 @@
  * - Handles the "first-time sync" by fetching all events in a defined time range.
  * - Handles infinitely recurring events (like anniversaries) during the first sync.
  * - Adds a visual prefix (e.g., "[Work]") to synced events.
- * - [NEW] Assigns a specific Google Calendar Color ID to events from each source.
+ * - Assigns a specific Google Calendar Color ID to events from each source.
  * - Includes throttling (`Utilities.sleep`) to avoid "Quota Exceeded" errors.
+ * - [v2.4] Includes utility functions to reset tokens or clear all synced events.
  *
  * @author [Tu Nombre/Usuario de Reddit]
- * @version 2.3
+ * @version 2.4
  */
 
 /**
@@ -42,7 +43,7 @@ const GLOBAL_CONFIG = {
   // Prefix for storing sync tokens. Do not change.
   TOKEN_PROPERTY_PREFIX: 'syncToken_',
 
-  // Pause (in milliseconds) after processing each event during the first sync.
+  // Pause (in milliseconds) after processing each event *during the first sync*.
   // Helps to avoid "Quota Exceeded" errors. 500ms is a safe value.
   INITIAL_SYNC_THROTTLE: 500,
 
@@ -51,6 +52,7 @@ const GLOBAL_CONFIG = {
   INITIAL_SYNC_PAST_DAYS: 7,
   
   // How far forward to look. Prevents infinite loops on recurring events.
+  // 365 is standard. If you hit a 6-minute timeout, see README.
   INITIAL_SYNC_FUTURE_DAYS: 365 
 };
 
@@ -113,26 +115,20 @@ function mainSyncFunction() {
     let syncToken = userProperties.getProperty(tokenPropertyKey);
 
     let requestParameters = {
-      showDeleted: true,  // <-- This is CRITICAL for catching deletions.
-      singleEvents: true, // Expands recurring events into single instances.
-      maxResults: 250     // Max changes per page.
+      showDeleted: true,
+      singleEvents: true,
+      maxResults: 250
     };
 
     if (syncToken) {
       // --- NORMAL SYNC (Using a Token) ---
-      // We have a token, so we only ask for changes since the last sync.
       requestParameters.syncToken = syncToken;
       Logger.log(`Sync (Token) starting for [${sourceCalendarName}]...`);
     } else {
       // --- FIRST-TIME SYNC (No Token) ---
-      // This is the first run for this calendar. We must "bootstrap" it
-      // by fetching all events in a specified date range.
-      
-      // (V2.1 Fix) Get events based on *when they occur*, not when they were *updated*.
       const startTime = new Date(Date.now() - (GLOBAL_CONFIG.INITIAL_SYNC_PAST_DAYS * 24 * 60 * 60 * 1000));
       requestParameters.timeMin = startTime.toISOString();
 
-      // (V2.2 Fix) Add a 'timeMax' to prevent infinite loops on infinitely recurring events.
       const endTime = new Date(Date.now() + (GLOBAL_CONFIG.INITIAL_SYNC_FUTURE_DAYS * 24 * 60 * 60 * 1000));
       requestParameters.timeMax = endTime.toISOString();
       
@@ -143,12 +139,8 @@ function mainSyncFunction() {
       let eventPages;
       let pageToken;
 
-      // --- PAGINATION LOOP ---
-      // Loop through all pages of results (if there are many changes)
       do {
         requestParameters.pageToken = pageToken;
-        
-        // Use the Advanced Calendar API
         eventPages = Calendar.Events.list(calendarId, requestParameters);
 
         if (!eventPages.items || eventPages.items.length === 0) {
@@ -156,18 +148,15 @@ function mainSyncFunction() {
           break; 
         }
 
-        // --- PROCESS CHANGES ---
         for (const sourceEvent of eventPages.items) {
           
           if (sourceEvent.status === 'cancelled') {
-            // This event was DELETED.
-            deleteTargetEvent(sourceEvent);
+            deleteTargetEvent(sourceEvent, sourceCalendarName);
           } else {
-            // This event was CREATED or UPDATED.
-            createOrUpdateEvent(sourceEvent, primaryCalendar, prefix, colorId);
+            createOrUpdateEvent(sourceEvent, primaryCalendar, prefix, colorId, sourceCalendarName);
           }
 
-          // (V1.1 Fix) Throttle the script during the first sync to avoid Quota errors
+          // Throttle *only* during the first sync to avoid 6-minute timeout
           if (!syncToken) { 
             Utilities.sleep(GLOBAL_CONFIG.INITIAL_SYNC_THROTTLE);
           }
@@ -175,15 +164,12 @@ function mainSyncFunction() {
         
         pageToken = eventPages.nextPageToken;
         
-        // If we are on a normal sync (with token), we don't need to manually
-        // page. The nextSyncToken handles this for the *next* run.
         if (syncToken && !pageToken) {
            break;
         }
 
       } while (pageToken);
 
-      // --- ¡IMPORTANT! Save the new token for the next run. ---
       if (eventPages.nextSyncToken) {
         userProperties.setProperty(tokenPropertyKey, eventPages.nextSyncToken);
         Logger.log(`   > New Sync Token saved for [${sourceCalendarName}].`);
@@ -191,13 +177,9 @@ function mainSyncFunction() {
 
     } catch (e) {
       if (e.message.includes('Sync token is no longer valid') || e.message.includes('410')) {
-        // This is a common, non-fatal error. The token expired (e.g., script
-        // was off for > 7 days). We delete the token to force a 
-        // full re-sync on the next run.
         Logger.log(`¡Sync Token Expired for [${sourceCalendarName}]! Deleting token to force re-sync.`);
         userProperties.deleteProperty(tokenPropertyKey);
       } else {
-        // A different error occurred (e.g., Quota).
         Logger.log(`Error syncing [${sourceCalendarName}]: ${e}`);
       }
     }
@@ -213,12 +195,15 @@ function mainSyncFunction() {
 
 /**
  * Creates or Updates an event in the target calendar.
+ * @param {object} sourceEvent - The event object from the source calendar (from Calendar API).
+ * @param {Calendar} targetCalendar - The CalendarApp object for the target calendar.
+ * @param {string} prefix - The text prefix (e.g., "[Work]") to add to the title.
+ * @param {string} sourceColorId - The Google Calendar color ID (1-11) to apply.
+ * @param {string} sourceCalendarName - The name of the source calendar (for logging).
  */
-function createOrUpdateEvent(sourceEvent, targetCalendar, prefix, sourceColorId) {
+function createOrUpdateEvent(sourceEvent, targetCalendar, prefix, sourceColorId, sourceCalendarName) {
   const sourceEventId = sourceEvent.id;
   
-  // 1. Check if this event (from this source) already exists in the target calendar.
-  // We use our 'SYNC_TAG_KEY' stored in extendedProperties to find it.
   const searchParameters = {
     privateExtendedProperty: `${GLOBAL_CONFIG.SYNC_TAG_KEY}=${sourceEventId}`
   };
@@ -232,23 +217,24 @@ function createOrUpdateEvent(sourceEvent, targetCalendar, prefix, sourceColorId)
     }
   } catch (e) {
      Logger.log(`Error searching for duplicate event: ${e}`);
-     return; // Skip this event
+     return;
   }
   
-  // 2. Prepare the event details (payload) for the target calendar.
   let title = sourceEvent.summary || '(No Title)';
-  if (prefix && !title.startsWith(prefix)) {
-      title = `${prefix} ${title}`;
+  
+  // If the prefix is from a *different* source, or has no prefix, add it.
+  // This correctly handles moving an event (e.g., from [Work] to [Univ]).
+  const currentPrefixMatch = title.match(/^\[(.*?)\]/);
+  if (!currentPrefixMatch || currentPrefixMatch[1] !== sourceCalendarName) {
+    if (currentPrefixMatch) {
+      // Remove the old prefix
+      title = title.substring(currentPrefixMatch[0].length).trim();
+    }
+    title = `${prefix} ${title}`;
   }
 
-  // Handle all-day events vs. specific-time events
-  const eventStart = sourceEvent.start.date ? 
-    { date: sourceEvent.start.date } : 
-    { dateTime: sourceEvent.start.dateTime };
-    
-  const eventEnd = sourceEvent.end.date ? 
-    { date: sourceEvent.end.date } : 
-    { dateTime: sourceEvent.end.dateTime };
+  const eventStart = sourceEvent.start.date ? { date: sourceEvent.start.date } : { dateTime: sourceEvent.start.dateTime };
+  const eventEnd = sourceEvent.end.date ? { date: sourceEvent.end.date } : { dateTime: sourceEvent.end.dateTime };
 
   const targetEventPayload = {
     summary: title,
@@ -257,10 +243,7 @@ function createOrUpdateEvent(sourceEvent, targetCalendar, prefix, sourceColorId)
     start: eventStart,
     end: eventEnd,
     recurrence: sourceEvent.recurrence || null,
-    colorId: sourceColorId, // <-- [NEW] Set the specific color
-    
-    // This "tag" is the most important part.
-    // It links this copied event back to its source event.
+    colorId: sourceColorId,
     extendedProperties: {
       private: {
         [GLOBAL_CONFIG.SYNC_TAG_KEY]: sourceEventId
@@ -268,14 +251,11 @@ function createOrUpdateEvent(sourceEvent, targetCalendar, prefix, sourceColorId)
     }
   };
 
-  // 3. Execute the Create or Update operation.
   try {
     if (existingTargetEvent) {
-      // --- UPDATE ---
       Calendar.Events.update(targetEventPayload, GLOBAL_CONFIG.TARGET_CALENDAR_ID, existingTargetEvent.id);
       Logger.log(`Event updated: [${title}]`);
     } else {
-      // --- CREATE ---
       Calendar.Events.insert(targetEventPayload, GLOBAL_CONFIG.TARGET_CALENDAR_ID);
       Logger.log(`Event created: [${title}]`);
     }
@@ -287,12 +267,13 @@ function createOrUpdateEvent(sourceEvent, targetCalendar, prefix, sourceColorId)
 
 /**
  * Deletes an event from the target calendar.
+ * @param {object} sourceEvent - The event object (status: 'cancelled') from the API.
+ * @param {string} sourceCalendarName - The name of the source calendar (for logging).
  */
-function deleteTargetEvent(sourceEvent) {
+function deleteTargetEvent(sourceEvent, sourceCalendarName) {
   const sourceEventId = sourceEvent.id;
-  Logger.log(`Processing DELETE for source ID: ${sourceEventId}`);
+  Logger.log(`Processing DELETE for source ID: ${sourceEventId} (from [${sourceCalendarName}])`);
 
-  // 1. Find the event in the target calendar using our tag.
   const searchParameters = {
     privateExtendedProperty: `${GLOBAL_CONFIG.SYNC_TAG_KEY}=${sourceEventId}`
   };
@@ -302,8 +283,6 @@ function deleteTargetEvent(sourceEvent) {
 
     if (foundEvents.items && foundEvents.items.length > 0) {
       const targetEvent = foundEvents.items[0];
-      
-      // 2. Found it! Now delete it.
       Calendar.Events.remove(GLOBAL_CONFIG.TARGET_CALENDAR_ID, targetEvent.id);
       Logger.log(`   > Deleted [${targetEvent.summary}] from target calendar.`);
       
@@ -317,16 +296,13 @@ function deleteTargetEvent(sourceEvent) {
 
 /**
  * ==============================================================================
- * UTILITY FUNCTION (Run Manually)
+ * UTILITY FUNCTIONS (Run Manually from Editor)
  * ==============================================================================
  */
 
 /**
- * Run this function manually from the Apps Script editor to reset all
- * sync tokens. This will force a full, clean re-sync of all calendars
- * on the next run.
- *
- * Useful if you change the date ranges or something gets stuck.
+ * Run this function manually to reset all sync tokens.
+ * This will force a full, clean re-sync of all calendars.
  */
 function resetAllSyncTokens() {
   const userProperties = PropertiesService.getUserProperties();
@@ -339,4 +315,51 @@ function resetAllSyncTokens() {
   }
   
   Logger.log('Reset complete! The next run will be a First-Time Sync for all calendars.');
+}
+
+/**
+ * [v2.4] DANGER! Run this function manually to delete ALL events
+ * in your Primary calendar that were created by this script.
+ * Useful for cleaning "orphan" events if the state becomes corrupted.
+ */
+function deleteAllSyncedEventsFromPrimary() {
+  Logger.log('WARNING! Starting cleanup of ALL synced events from Primary calendar...');
+  const primaryCalAPI = Calendar.Events;
+  let pageToken;
+  let deletedCount = 0;
+
+  do {
+    try {
+      // Use 'q' parameter to find all events that HAVE our sync tag
+      const events = primaryCalAPI.list(GLOBAL_CONFIG.TARGET_CALENDAR_ID, {
+        q: `extendedProperty:${GLOBAL_CONFIG.SYNC_TAG_KEY}`, // <-- Find events with this tag
+        maxResults: 250,
+        pageToken: pageToken
+      });
+
+      if (!events.items || events.items.length === 0) {
+        Logger.log('No more synced events found to delete.');
+        break;
+      }
+
+      for (const event of events.items) {
+        try {
+          primaryCalAPI.remove(GLOBAL_CONFIG.TARGET_CALENDAR_ID, event.id);
+          Logger.log(`   > Deleted [${event.summary}] (ID: ${event.id})`);
+          deletedCount++;
+        } catch (e) {
+          Logger.log(`Error deleting [${event.summary}]: ${e}`);
+        }
+        // Brief pause to avoid 'remove' quota errors
+        Utilities.sleep(300); 
+      }
+      pageToken = events.nextPageToken;
+
+    } catch (e) {
+      Logger.log(`Error searching for events to delete: ${e}`);
+      break;
+    }
+  } while (pageToken);
+
+  Logger.log(`Cleanup complete. Deleted ${deletedCount} events.`);
 }
