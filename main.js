@@ -18,7 +18,7 @@
  * - [NEW] Assigns a specific Google Calendar Color ID to events from each source.
  * - Includes throttling (`Utilities.sleep`) to avoid "Quota Exceeded" errors.
  *
- * @author [Tu Nombre/Usuario de Reddit]
+ * @author name_Pepo
  * @version 2.3
  */
 
