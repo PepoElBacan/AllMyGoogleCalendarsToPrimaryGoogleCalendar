@@ -19,7 +19,7 @@
  * - Includes throttling (`Utilities.sleep`) to avoid "Quota Exceeded" errors.
  * - [v2.4] Includes utility functions to reset tokens or clear all synced events.
  *
- * @author [Tu Nombre/Usuario de Reddit]
+ * @author [name_Pepo]
  * @version 2.4
  */
 
